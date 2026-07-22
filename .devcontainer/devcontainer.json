@@ -1,0 +1,23 @@
+{
+  "name": "scunveil-training",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "runArgs": ["--gpus", "all"],
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "mounts": [
+    "source=${localEnv:SCUNVEIL_DATA_DIR},target=/workspace/data,type=bind",
+    "source=${localEnv:SCUNVEIL_RESULTS_DIR},target=/workspace/results,type=bind"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}
