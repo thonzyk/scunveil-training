@@ -3,7 +3,8 @@
 This repository contains the data-preparation and pretraining pipeline used to
 train scUNVEIL on human single-cell RNA-sequencing data from the CZ CELLxGENE
 Census. It covers the complete path from downloading and filtering Census data
-to training the model and exporting embeddings with a PCA transformation.
+to training the model and building a publication bundle for the separate
+scUNVEIL inference package.
 
 The repository is intentionally research-oriented. The numbered scripts and
 notebooks are the canonical description of the training procedure; the goal of
@@ -24,28 +25,32 @@ global gene-frequency ordering
 randomly shuffled training shards
         |
         v
-scUNVEIL pretraining
+scUNVEIL pretraining and float32 checkpoints
         |
         v
-cell embeddings
+float16 checkpoint export and loss comparison
         |
         v
-PCA matrix and mean
+streamed full PCA of model embeddings
+        |
+        v
+publish/ bundle for the inference repository
 ```
 
 During pretraining, each raw count vector is split by binomial thinning. The
 model receives the log-transformed retained counts and predicts the normalized
 distribution of the held-out counts. The final normalized hidden representation
-is used as the cell embedding.
+is used as the cell embedding. The output projection uses the transpose of the
+same gene-to-embedding weight matrix as the input projection.
 
 ## Repository structure
 
 ```text
 .
-├── .devcontainer/          Reproducible GPU development environment
+├── .devcontainer/          Standalone GPU container configuration
 ├── src/
 │   ├── prepare_data/       Numbered CELLxGENE preparation scripts
-│   └── training/           Model code and ordered training notebooks
+│   └── training/           Model code, pretraining notebook, export script
 ├── data/                   Mounted data directory; not tracked by Git
 └── results/                Mounted training-output directory; not tracked by Git
 ```
@@ -57,8 +62,8 @@ checkpoints.
 ## Requirements
 
 - A Linux host with Docker
-- Visual Studio Code with the Dev Containers extension for the recommended
-  workflow, or the Docker CLI for the editor-independent alternative
+- Either Visual Studio Code with the Dev Containers extension or the Docker
+  CLI
 - An NVIDIA GPU with a working NVIDIA Container Toolkit installation
 - Internet access for building the image and querying the CELLxGENE Census
 - Substantial local storage; expect the complete workflow to require hundreds
@@ -70,11 +75,14 @@ and number of retained checkpoints.
 
 ## Environment setup
 
-The supported environment is defined by
+The standalone repository environment is defined by
 [`.devcontainer/Dockerfile`](.devcontainer/Dockerfile) and
 [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json). The
-container provides TensorFlow with GPU support, Jupyter, the CELLxGENE client,
-AnnData, scikit-learn, and the remaining Python dependencies used here.
+container currently uses the TensorFlow 2.17 GPU/Jupyter image and installs
+the CELLxGENE client, AnnData, scikit-learn, W&B, and the other Python
+dependencies used here. The development workspace can also run these scripts
+if it provides the same packages and mounts at `/workspace/data` and
+`/workspace/results`.
 
 Create persistent host directories for data and results, then expose their
 locations as environment variables. For example, add the following to
@@ -94,7 +102,7 @@ source ~/.bashrc
 mkdir -p "$SCUNVEIL_DATA_DIR" "$SCUNVEIL_RESULTS_DIR/training"
 ```
 
-### Recommended: VS Code Dev Container
+### Option A: VS Code Dev Container
 
 Open this repository in VS Code from that environment and select **Dev
 Containers: Reopen in Container**. The Dev Container configuration builds the
@@ -105,7 +113,7 @@ $SCUNVEIL_DATA_DIR     -> /workspace/data
 $SCUNVEIL_RESULTS_DIR  -> /workspace/results
 ```
 
-### Alternative: Docker CLI
+### Option B: Docker CLI
 
 VS Code is not required. From the repository root, build the same image
 directly:
@@ -141,7 +149,11 @@ jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
 
 Both approaches provide the same repository layout. All source code assumes
 the `/workspace/data` and `/workspace/results` container paths; run the
-remaining commands inside the selected container environment.
+remaining commands inside the selected container environment. In the combined
+`scunveil-dev` workspace, the source lives at
+`/workspace/subprojects/01_scunveil-training/`; use its `src/prepare_data` and
+`src/training` directories in the commands below. The data and results paths
+remain `/workspace/data` and `/workspace/results`.
 
 ## 1. Prepare the CELLxGENE training data
 
@@ -152,7 +164,8 @@ run from their own directory so that local imports resolve consistently:
 cd /workspace/src/prepare_data
 ```
 
-The Census snapshot and filtering thresholds are defined in
+The Census snapshot (`2025-11-08`), dataset exclusions, and filtering
+thresholds are defined in
 [`constants.py`](src/prepare_data/constants.py).
 
 ### 1.1 Discover datasets
@@ -211,9 +224,9 @@ used consistently by the remaining stages.
 python 05_generate_shuffled_shards.py
 ```
 
-Randomly mixes cells across source datasets, divides them into equally sized
-AnnData shards, applies the global gene ordering, and retains the observation
-metadata used by the project. Shards are written to:
+Randomly mixes cells across source datasets, divides them into 1,000 equally
+sized AnnData shards, applies the global gene ordering, and retains the
+observation metadata used by the project. Shards are written to:
 
 ```text
 data/shuffled_shards/*.h5ad
@@ -230,12 +243,17 @@ if this stage is rerun.
 python 06_saving_ds_info.py
 ```
 
-Retrieves Census metadata for the selected datasets and writes:
+Reads the dataset IDs actually present in the finished training shards, checks
+that excluded IDs are absent, and retrieves their Census metadata. By default
+it writes:
 
 ```text
 data/ds_info.csv
 data/Supplementary_Table_S1_training_datasets.csv
 ```
+
+Set `SCUNVEIL_METADATA_OUTPUT_ROOT` to write these two files elsewhere while
+leaving the training shards untouched.
 
 ### 1.7 Save ordered gene metadata
 
@@ -264,11 +282,16 @@ The notebook:
 5. trains it using the transcript-thinning objective; and
 6. saves a checkpoint after each training epoch.
 
+The run configuration explicitly includes `emb_dim`, `ff_dim`, `n_layers`, and
+`n_genes`. Keep `ff_dim` in the saved configuration: export and inference must
+reconstruct exactly the architecture used for the checkpoint.
+
 Each run is stored under:
 
 ```text
 results/training/<experiment_id>/
 ├── config.json
+├── src/                 Snapshot of the training Python modules
 └── weights/
     └── <epoch>.weights.h5
 ```
@@ -281,54 +304,75 @@ when the experiment is created. Model and data-loader implementations are in
 
 ### Optional Weights & Biases logging
 
-Training runs without W&B by default. To enable it, create
-`src/training/wandb_login.json` before running the notebook:
+The current notebook has `CONFIG['use_wandb'] = True`. Set it to `False` if you
+do not want to log a run. To use W&B, log in from a terminal inside the same
+container and as the same user as the notebook:
 
-```json
-{
-  "key": "YOUR_WANDB_API_KEY",
-  "entity": "YOUR_WANDB_ENTITY"
-}
+```bash
+wandb login
 ```
 
-The file is ignored by Git. Its location is resolved relative to the notebook's
-working directory, which is another reason to run the notebook from
-`/workspace/src/training`.
+W&B uses the saved credentials automatically; no `wandb_login.json` file is
+needed. The project is selected by `CONFIG['project']`. To select a specific
+team/account, optionally set `WANDB_ENTITY` in the environment before starting
+the notebook kernel; otherwise W&B uses its configured/default entity.
 
-## 3. Generate cell embeddings
+Credentials saved inside a container may need to be established again after
+rebuilding it unless its credential storage is persisted.
 
-Open [`002_generate_embeddings.ipynb`](src/training/002_generate_embeddings.ipynb).
-In its first cell, select the completed `EXPERIMENT_ID` and the desired
-checkpoint through `WEIGHTS_ID`, then run the notebook from top to bottom.
+## 3. Build the inference publish bundle
 
-The notebook reconstructs the model from the saved `config.json`, loads the
-selected checkpoint, and exports the final hidden representation for cells in
-the shuffled shards. Embeddings are stored as clipped float16 NumPy arrays:
+Edit the constants at the top of
+[`002_export_publish_package.py`](src/training/002_export_publish_package.py):
+set `WEIGHTS_PATH` to the original float32 `.weights.h5` checkpoint you want
+to publish, and choose `N_LOSS_CELLS`, `N_PCA_CELLS`, `BATCH_SIZE`, and
+`MAX_LOSS_INCREASE`. The script has no command-line arguments. Run it from the
+training directory so its local imports resolve:
+
+```bash
+cd /workspace/src/training
+python 002_export_publish_package.py
+```
+
+The script opens training shards in backed mode and then:
+
+1. copies the checkpoint weights to float16 in bounded HDF5 chunks, excluding
+   optimizer state;
+2. loads the float32 and float16 weights into separate models and compares
+   their loss on identical freshly thinned batches from the **training** shard
+   distribution, rejecting an increase above `MAX_LOSS_INCREASE`;
+3. computes all PCA components from a streamed float64 embedding covariance
+   matrix, using the float16-exported weights, and checks the stored component
+   orientation; and
+4. copies the run configuration and ordered gene metadata into one publish
+   directory, along with an export report.
+
+The loss comparison tests rounding on training-style samples, not performance
+on an independent test dataset. Embeddings are processed by batch and are not
+stored as intermediate shard files or clipped. The PCA matrix has principal
+components in its **columns**; the inference package applies the saved mean
+and matrix in that orientation.
+
+The current script defaults to 100,000 cells for the loss check and 1,000,000
+cells for PCA. It first writes into a temporary directory and renames that
+directory only after a successful export. It refuses to overwrite an existing
+`publish/` directory.
 
 ```text
-data/shuffled_shards_emb/<shard_id>.npy
+results/training/<experiment_id>/publish/
+├── config.json
+├── var_sorted.csv
+├── weights.weights.h5
+├── pca_mean.npy
+├── pca_mat.npy
+└── export_report.json
 ```
 
-As currently written, the notebook processes the first 50 shuffled shards. If
-more embedding shards are required, adjust the shard slice in the final cell
-deliberately and ensure sufficient storage is available.
-
-## 4. Fit and export PCA
-
-Open [`003_calculate_PCA.ipynb`](src/training/003_calculate_PCA.ipynb), select
-the same experiment and checkpoint in its first cell, and run all cells.
-
-The notebook fits PCA on a subset of the generated embeddings, checks
-reconstruction on a held-out subset, and saves the complete PCA transformation
-next to the selected checkpoint:
-
-```text
-results/training/<experiment_id>/weights/<checkpoint>_pca_mat.npy
-results/training/<experiment_id>/weights/<checkpoint>_pca_mean.npy
-```
-
-Together, the model checkpoint, PCA matrix, PCA mean, ordered gene metadata,
-and experiment configuration describe the exported representation.
+For the separately released inference package, upload the **contents** of
+`publish/` directly to `models/<version>/` in the scUNVEIL Hugging Face model
+repository. The five files other than `export_report.json` are used by the
+inference loader; the report records the source checkpoint and export checks.
+The inference package chooses its default model version in its own code.
 
 ## Expected data layout
 
@@ -341,7 +385,6 @@ data/
 ├── umi_nonzero.npy
 ├── genes_argsort.npy
 ├── shuffled_shards/
-├── shuffled_shards_emb/
 ├── ds_info.csv
 ├── Supplementary_Table_S1_training_datasets.csv
 └── var_sorted.csv
@@ -350,7 +393,9 @@ results/
 └── training/
     └── <experiment_id>/
         ├── config.json
-        └── weights/
+        ├── src/
+        ├── weights/
+        └── publish/
 ```
 
 ## License
