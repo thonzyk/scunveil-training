@@ -3,6 +3,7 @@ import os
 import json
 import shutil
 from datetime import datetime
+from pathlib import Path
 
 
 def create_new_experiment(config):
@@ -16,12 +17,13 @@ def create_new_experiment(config):
     with open(RESULTS_ROOT / 'training' / experiment_id / 'config.json', 'w', encoding='utf-8') as fw:
         json.dump(config, fw, indent=4)
 
-    f_names = os.listdir('/')
-    f_names = [f_name for f_name in f_names if str(f_name).endswith('.py')]
+    source_dir = Path(__file__).resolve().parent
+    backup_dir = RESULTS_ROOT / 'training' / experiment_id / 'src'
+    backup_dir.mkdir()
 
-    for f_name in f_names:
+    for source_file in source_dir.glob('*.py'):
         try:
-            shutil.copy(f_name, RESULTS_ROOT / 'training' / experiment_id / 'src' / f_name)
+            shutil.copy2(source_file, backup_dir / source_file.name)
         except Exception as e:
             print(f"Error occurred: {e}")
 

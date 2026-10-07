@@ -70,7 +70,7 @@ def pretrain_batch_from_x_tf(x_batch):
     # log1p norm
     x_dil_sp = tf.SparseTensor(
         indices=x_dil_sp.indices,
-        values=tf.cast(tf.math.log1p(x_dil_sp.values), tf.float16),
+        values=tf.math.log1p(x_dil_sp.values),
         dense_shape=x_dil_sp.dense_shape
     )
 
